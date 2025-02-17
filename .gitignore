@@ -1,0 +1,4 @@
+ec-clean
+.gdb_history
+
+*.S
