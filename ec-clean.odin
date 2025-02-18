@@ -5,9 +5,8 @@ import    "core:bytes"
 import os "core:os/os2"
 import    "core:strings"
 import    "core:strconv"
-//import    "core:unicode"
 
-import "../getargs"
+import "getargs"
 
 main :: proc() {
 	ap := getargs.make_getargs()
@@ -332,14 +331,14 @@ _tokenize :: proc(input: string) -> []Token {
 		append(tokens, token)
 	}
 
-	consume_name :: proc(tokens: ^[dynamic]Token, s: string, idx: ^int) -> Token_Kind {
+	consume_name :: proc(tokens: ^[dynamic]Token, s: string, idx: ^int, allow_dot: bool = false) -> Token_Kind {
 		start := idx^
 		kind: Token_Kind = .Name
 		if s[start] == '@' {
 			kind = .Deref
 			idx^ += 1
 		}
-		end := get_name(s[idx^:])
+		end := get_name(s[idx^:], allow_dot)
 
 		reg, is_reg := _register_map[s[idx^:idx^+end]]
 		if kind == .Deref {
@@ -483,7 +482,7 @@ _tokenize :: proc(input: string) -> []Token {
 		}
 	}
 
-	get_name :: proc(s: string) -> int {
+	get_name :: proc(s: string, allow_dot: bool = false) -> int {
 		i: int
 		for i < len(s) {
 			if is_alpha(s[i]) || is_digit(s[i]) {
@@ -495,6 +494,10 @@ _tokenize :: proc(input: string) -> []Token {
 				i += 1
 				continue
 			case '.':
+				if allow_dot {
+					i += 1
+					continue
+				}
 				// single dot could be bit address
 				if i + 2 < len(s) && s[i + 1] == '.' && s[i + 2] == '.' {
 					i += 3
@@ -580,9 +583,9 @@ _tokenize :: proc(input: string) -> []Token {
 			end := get_spaces(input[idx:])
 			consume_token(&tokens, .Whitespace, &idx, end)
 
-			if is_alpha(input[idx]) {
-				kind := consume_name(&tokens, input, &idx)
-				assert(kind == .Name)
+			if is_alpha(input[idx]) || is_digit(input[idx]) {
+				kind := consume_name(&tokens, input, &idx, true)
+				assert(kind == .Name || kind == .Register)
 
 				assert(input[idx] == ':')
 				tokens[len(tokens) - 1].kind = .Label
