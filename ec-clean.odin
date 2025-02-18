@@ -391,6 +391,43 @@ _tokenize :: proc(input: string) -> []Token {
 		append(tokens, token)
 	}
 
+	consume_data :: proc(tokens: ^[dynamic]Token, s: string, idx: ^int) {
+		i := idx^
+		for ; i < len(s) && s[i] != '\n' && s[i] != ' '; i += 1 { }
+
+		assert(i - idx^ == 3)
+		assert(s[i-1] == 'h')
+
+		val, ok := strconv.parse_uint(s[idx^:i - 1], 16)
+		assert(ok)
+
+		consume_token(tokens, .Data_Hex, idx, 3, val)
+
+		if s[i] == '\n' {
+			return
+		}
+
+		n := get_spaces(s[idx^:])
+		if n == 0 {
+			return
+		}
+
+		if idx^ + n >= len(s) || s[idx^ + n] == '\n' {
+			consume_token(tokens, .Trailing_Space, idx, n)
+			return
+		}
+		consume_token(tokens, .Whitespace, idx, n)
+		if s[idx^] == ';' {
+			return
+		}
+
+		if s[idx^] == '"' && s[idx^ + 1] == '"' {
+			consume_token(tokens, .Data_Ascii, idx, 2)
+		} else {
+			consume_token(tokens, .Data_Ascii, idx, 1)
+		}
+	}
+
 	consume_args :: proc(tokens: ^[dynamic]Token, s: string, idx: ^int) {
 		arg_count: int
 		for idx^ < len(s) && s[idx^] != ' ' && s[idx^] != '\n' {
@@ -448,10 +485,23 @@ _tokenize :: proc(input: string) -> []Token {
 
 	get_name :: proc(s: string) -> int {
 		i: int
-		for ; i < len(s); i += 1 {
-			if !is_alpha(s[i]) && !is_digit(s[i]) && s[i] != '_' && s[i] != '-' {
-				break
+		for i < len(s) {
+			if is_alpha(s[i]) || is_digit(s[i]) {
+				i += 1
+				continue
 			}
+			switch s[i] {
+			case '_', '-', '/':
+				i += 1
+				continue
+			case '.':
+				// single dot could be bit address
+				if i + 2 < len(s) && s[i + 1] == '.' && s[i + 2] == '.' {
+					i += 3
+					continue
+				}
+			}
+			break
 		}
 		return i
 	}
@@ -513,10 +563,16 @@ _tokenize :: proc(input: string) -> []Token {
 			consume_token(&tokens, .Whitespace, &idx, end)
 
 			consume_instruction(&tokens, input, &idx)
+			instruction := tokens[len(tokens) - 1].instruction
 
 			end = get_spaces(input[idx:])
 			if end != 0 {
 				consume_token(&tokens, .Whitespace, &idx, end)
+			}
+
+			if instruction == .Invalid {
+				consume_data(&tokens, input, &idx)
+			} else {
 				consume_args(&tokens, input, &idx)
 			}
 
