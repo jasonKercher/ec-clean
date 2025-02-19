@@ -53,8 +53,9 @@ main :: proc() {
 	}
 
 	_init_maps()
-	tokens := _tokenize(string(input))
+	tokens, offsets := _tokenize(string(input))
 
+	lines := _analyze(tokens)
 }
 
 _instruction_map: map[string]Instruction
@@ -96,6 +97,7 @@ Token_Kind :: enum u8 {
 	Trailing_Space,
 	Label_Offset,
 	Register_Offset,
+	Memory_Info,
 }
 
 Token :: struct {
@@ -278,8 +280,10 @@ _init_maps :: proc() {
 	_register_map["R7"]   = .R7
 }
 
-_tokenize :: proc(input: string) -> []Token {
+_tokenize :: proc(input: string) -> ([]Token, []i32) {
 	tokens: [dynamic]Token
+
+	offsets := make([]i32, 1024 * 128)
 
 	is_alpha :: proc(ch: u8) -> bool {
 		ch := ch & ~u8(0x20)
@@ -535,13 +539,21 @@ _tokenize :: proc(input: string) -> []Token {
 			end := strings.index_byte(input[idx:], ':')
 			assert(end != -1)
 
+			// offset to make the labeled address correct
+			address_offset: uint
 			switch input[idx:idx+end] {
-			case "CODE","B0","B1","B2":
+			case "CODE","B0":
+			case "B1":
+				address_offset = 0x8000
+			case "B2":
+				address_offset = 0x10000
 			case:
-				// memory label.. exclude
-				idx += get_to_eol(input[idx:])
+				line_len := get_to_eol(input[idx:])
+				consume_token(&tokens, .Memory_Info, &idx, line_len)
 				continue
 			}
+			offset := len(tokens)
+
 			consume_token(&tokens, .Location_Label, &idx, end)
 			consume_token(&tokens, .Label_Sym, &idx, 1)
 
@@ -560,6 +572,8 @@ _tokenize :: proc(input: string) -> []Token {
 			assert(end != -1)
 			v, ok := strconv.parse_uint(input[idx:idx+end], 16)
 			assert(ok)
+
+			offsets[v + address_offset] = i32(offset)
 
 			consume_token(&tokens, .Location, &idx, end, v)
 
@@ -616,6 +630,15 @@ _tokenize :: proc(input: string) -> []Token {
 		consume_token(&tokens, .Line_End, &idx, 1)
 	}
 
-	return tokens[:]
+	return tokens[:], offsets
 }
 
+Line_Kind :: enum {
+	Data,
+	Code,
+	Label,
+	Comment,
+	Function_Header,
+	Dptr_Jump,
+	Memory_Location,
+}
