@@ -429,8 +429,10 @@ _tokenize :: proc(input: string) -> []Token {
 
 	consume_args :: proc(tokens: ^[dynamic]Token, s: string, idx: ^int) {
 		arg_count: int
-		for idx^ < len(s) && s[idx^] != ' ' && s[idx^] != '\n' {
+		for idx^ < len(s) {
 			switch s[idx^] {
+			case ';', ' ', '\n':
+				return
 			case '@':
 				kind := consume_name(tokens, s, idx)
 				assert(kind == .Deref)
@@ -547,6 +549,11 @@ _tokenize :: proc(input: string) -> []Token {
 				skip := strings.index_byte(input[idx:], ':')
 				assert(skip != -1)
 				idx += skip + 1
+
+				// double ::
+				if input[idx] == ':' {
+					idx += 1
+				}
 			}
 
 			end = strings.index_byte(input[idx:], ' ')
