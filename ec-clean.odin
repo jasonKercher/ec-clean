@@ -5,37 +5,42 @@ import    "core:bytes"
 import os "core:os/os2"
 import    "core:strings"
 import    "core:strconv"
+import    "core:bufio"
 
 import "getargs"
 
 main :: proc() {
-	ap := getargs.make_getargs()
-	getargs.add_arg(&ap, "h", "help", .None)
-	getargs.add_arg(&ap, "p", "prev", .Required)
-	getargs.add_arg(&ap, "o", "output", .Required)
-	getargs.read_args(&ap, os.args)
+	args := getargs.make_getargs()
+	defer getargs.destroy(&args)
+	getargs.add_arg(&args, "h", "help", .None)
+	getargs.add_arg(&args, "p", "prev", .Required)
+	getargs.add_arg(&args, "o", "output", .Required)
+	getargs.read_args(&args, os.args)
 
-	if getargs.get_flag(&ap, "h") {
+	if getargs.get_flag(&args, "h") {
 		fmt.println("no help for you!")
 		os.exit(0)
 	}
 
-	output_name, found := getargs.get_payload(&ap, "o")
-	if !found {
-		output_name = ""
+	output_file: ^os.File = os.stdout
+	if output_name, found := getargs.get_payload(&args, "o"); found {
+		err: os.Error
+		output_file, err = os.open(output_name, {.Read, .Write, .Trunc, .Create}, 0o664)
+		if err != nil {
+			os.print_error(os.stderr, err, output_name)
+			os.exit(1)
+		}
 	}
 
-	prev_name: string
-	prev_name, found = getargs.get_payload(&ap, "p")
-	if found {
+	if prev_name, found := getargs.get_payload(&args, "p"); found {
 		unimplemented("--prev not implemented")
 	}
 
-	if ap.arg_idx >= len(os.args) {
+	if args.arg_idx >= len(os.args) {
 		fmt.eprintln("Expected asm file input")
 		os.exit(1)
 	}
-	input_file := os.args[ap.arg_idx]
+	input_file := os.args[args.arg_idx]
 
 	input, err := os.read_entire_file(input_file, context.allocator)
 	if err != nil {
@@ -44,18 +49,13 @@ main :: proc() {
 	}
 	defer delete(input)
 
-	output_file: ^os.File = os.stdout
-	if output_name != "" {
-		output_file, err = os.open(output_name, {.Read, .Write, .Trunc, .Create}, 0o664)
-		if err != nil {
-			os.print_error(os.stderr, err, output_name)
-		}
-	}
-
-	_init_maps()
+	data_init()
 	tokens, offsets := _tokenize(string(input))
 
-	lines := _analyze(tokens)
+	_remove_useless_comments(tokens)
+
+	_write_output(output_file, input, tokens)
+	os.close(output_file)
 }
 
 _instruction_map: map[string]Instruction
@@ -72,9 +72,9 @@ LJMP_TO_BANK_JUMP_2 :: "024e28"
 LJMP_TO_BANK_JUMP_3 :: "024e3c"  // unused...
 
 Token_Kind :: enum u8 {
-	Ignore,
+	Null,        // edited out
 	Whitespace,
-	Line_End,
+	Eol,
 	Data_Hex,
 	Data_Ascii,
 	Name,
@@ -86,6 +86,7 @@ Token_Kind :: enum u8 {
 	Deref_Label,
 	Deref_Label_Sym,
 	Comment,
+	Comment_Useless,
 	Arg_Label,
 	Location,
 	Location_Label,
@@ -113,171 +114,10 @@ Token :: struct {
 
 #assert(size_of(Token) == 8)
 
-Instruction :: enum u8 {
-	Invalid,
-	ACALL,
-	ADD,
-	ADDC,
-	AJMP,
-	ANL,
-	CJNE,
-	CLR,
-	CPL,
-	DA,
-	DEC,
-	DIV,
-	DJNZ,
-	INC,
-	JB,
-	JBC,
-	JC,
-	JMP,
-	JNB,
-	JNC,
-	JNZ,
-	JZ,
-	LCALL,
-	LJMP,
-	MOV,
-	MOVC,
-	MOVX,
-	MUL,
-	NOP,
-	ORL,
-	POP,
-	PUSH,
-	RET,
-	RETI,
-	RL,
-	RLC,
-	RR,
-	RRC,
-	SETB,
-	SJMP,
-	SUBB,
-	SWAP,
-	XCH,
-	XCHD,
-	XRL,
-}
-
-Register :: enum u8 {
-	A,
-	ACC = A,
-	B,
-	DPH,
-	DPL,
-	DPTR,
-	IE,
-	IP,
-	P0,
-	P1,
-	P2,
-	P3,
-	PCON,
-	PSW,
-	PSW1,
-	SCON,
-	SBUF,
-	SP,
-	TMOD,
-	TCON,
-	TL0,
-	TH0,
-	TL1,
-	TH1,
-	TL2,
-	TH2,
-	R0,
-	R1,
-	R2,
-	R3,
-	R4,
-	R5,
-	R6,
-	R7,
-}
-
-_init_maps :: proc() {
-	_instruction_map["ACALL"] = .ACALL
-	_instruction_map["ADD"]   = .ADD
-	_instruction_map["ADDC"]  = .ADDC
-	_instruction_map["AJMP"]  = .AJMP
-	_instruction_map["ANL"]   = .ANL
-	_instruction_map["CJNE"]  = .CJNE
-	_instruction_map["CLR"]   = .CLR
-	_instruction_map["CPL"]   = .CPL
-	_instruction_map["DA"]    = .DA
-	_instruction_map["DEC"]   = .DEC
-	_instruction_map["DIV"]   = .DIV
-	_instruction_map["DJNZ"]  = .DJNZ
-	_instruction_map["INC"]   = .INC
-	_instruction_map["JB"]    = .JB
-	_instruction_map["JBC"]   = .JBC
-	_instruction_map["JC"]    = .JC
-	_instruction_map["JMP"]   = .JMP
-	_instruction_map["JNB"]   = .JNB
-	_instruction_map["JNC"]   = .JNC
-	_instruction_map["JNZ"]   = .JNZ
-	_instruction_map["JZ"]    = .JZ
-	_instruction_map["LCALL"] = .LCALL
-	_instruction_map["LJMP"]  = .LJMP
-	_instruction_map["MOV"]   = .MOV
-	_instruction_map["MOVC"]  = .MOVC
-	_instruction_map["MOVX"]  = .MOVX
-	_instruction_map["MUL"]   = .MUL
-	_instruction_map["NOP"]   = .NOP
-	_instruction_map["ORL"]   = .ORL
-	_instruction_map["POP"]   = .POP
-	_instruction_map["PUSH"]  = .PUSH
-	_instruction_map["RET"]   = .RET
-	_instruction_map["RETI"]  = .RETI
-	_instruction_map["RL"]    = .RL
-	_instruction_map["RLC"]   = .RLC
-	_instruction_map["RR"]    = .RR
-	_instruction_map["RRC"]   = .RRC
-	_instruction_map["SETB"]  = .SETB
-	_instruction_map["SJMP"]  = .SJMP
-	_instruction_map["SUBB"]  = .SUBB
-	_instruction_map["SWAP"]  = .SWAP
-	_instruction_map["XCH"]   = .XCH
-	_instruction_map["XCHD"]  = .XCHD
-	_instruction_map["XRL"]   = .XRL
-
-	_register_map["A"]    = .A
-	_register_map["ACC"]  = .ACC
-	_register_map["B"]    = .B
-	_register_map["DPH"]  = .DPH
-	_register_map["DPL"]  = .DPL
-	_register_map["DPTR"] = .DPTR
-	_register_map["IE"]   = .IE
-	_register_map["IP"]   = .IP
-	_register_map["P0"]   = .P0
-	_register_map["P1"]   = .P1
-	_register_map["P2"]   = .P2
-	_register_map["P3"]   = .P3
-	_register_map["PCON"] = .PCON
-	_register_map["PSW"]  = .PSW
-	_register_map["PSW1"] = .PSW1
-	_register_map["SCON"] = .SCON
-	_register_map["SBUF"] = .SBUF
-	_register_map["SP"]   = .SP
-	_register_map["TMOD"] = .TMOD
-	_register_map["TCON"] = .TCON
-	_register_map["TL0"]  = .TL0
-	_register_map["TH0"]  = .TH0
-	_register_map["TL1"]  = .TL1
-	_register_map["TH1"]  = .TH1
-	_register_map["TL2"]  = .TL2
-	_register_map["TH2"]  = .TH2
-	_register_map["R0"]   = .R0
-	_register_map["R1"]   = .R1
-	_register_map["R2"]   = .R2
-	_register_map["R3"]   = .R3
-	_register_map["R4"]   = .R4
-	_register_map["R5"]   = .R5
-	_register_map["R6"]   = .R6
-	_register_map["R7"]   = .R7
+Edit :: struct {
+	text:       string,
+	insert_idx: i32,
+	_:          i32,
 }
 
 _tokenize :: proc(input: string) -> ([]Token, []i32) {
@@ -621,24 +461,74 @@ _tokenize :: proc(input: string) -> ([]Token, []i32) {
 				consume_token(&tokens, .Whitespace, &idx, end)
 			}
 			end = get_to_eol(input[idx:])
-			consume_token(&tokens, .Comment, &idx, end)
+
+			comment := input[idx:idx+end]
+			comment_kind : Token_Kind = .Comment
+
+			if len(comment) >= 2 && comment[:2] == ";*" {
+				comment_kind = .Comment_Useless
+			} else if len(comment) >= 5 && comment[:5] == ";XREF" {
+				comment_kind = .Comment_Useless
+			} else if len(comment) >= 15 && comment[:14] == ";             " {
+				comment_kind = .Comment_Useless
+			} else if len(comment) == 5 && comment == ";= ??" {
+				comment_kind = .Comment_Useless
+			} else if len(comment) >= 10 && comment[:10] == ";undefined" {
+				comment_kind = .Comment_Useless
+			}
+			consume_token(&tokens, comment_kind, &idx, end)
 		} else if input[idx+end] == '\n' && end > 0 {
 			consume_token(&tokens, .Trailing_Space, &idx, end)
 		}
 
 		assert(input[idx] == '\n')
-		consume_token(&tokens, .Line_End, &idx, 1)
+		consume_token(&tokens, .Eol, &idx, 1)
 	}
 
 	return tokens[:], offsets
 }
 
-Line_Kind :: enum {
-	Data,
-	Code,
-	Label,
-	Comment,
-	Function_Header,
-	Dptr_Jump,
-	Memory_Location,
+_remove_useless_comments :: proc(tokens: []Token) {
+	line_begin := 0
+	for i := 0; i < len(tokens); i += 1 {
+		if tokens[i].kind == .Eol {
+			line_begin = i + 1
+			continue
+		}
+		if tokens[i].kind == .Comment_Useless {
+			if i >= line_begin && tokens[i-1].kind == .Whitespace {
+				tokens[i-1].kind = .Null
+				tokens[i].kind = .Null
+				if i - 1 == line_begin && tokens[i + 1].kind == .Eol {
+					tokens[i+1].kind = .Null
+					line_begin = i + 2
+				}
+			}
+		}
+	}
+}
+
+_write_output :: proc(f: ^os.File, input: []u8, tokens: []Token) {
+	stream := os.to_stream(f)
+	w: bufio.Writer
+	bufio.writer_init(&w, stream)
+
+	for t in tokens {
+		data := input[t.start:t.start+i32(t.length)]
+		#partial switch t.kind {
+		case .Trailing_Space:
+		case .Null:
+			continue
+		case .Data_Ascii:
+			if t.kind == .Data_Ascii && t.length == 1 && data[0] == '"' {
+				q := "\"\""
+				bufio.writer_write_string(&w, q)
+				continue
+			}
+		}
+
+		bufio.writer_write(&w, data)
+	}
+
+	bufio.writer_flush(&w)
 }
