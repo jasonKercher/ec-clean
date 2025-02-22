@@ -2,6 +2,7 @@ package ecclean
 
 import    "core:fmt"
 import    "core:bytes"
+import    "core:slice"
 import os "core:os/os2"
 import    "core:strings"
 import    "core:strconv"
@@ -54,13 +55,14 @@ main :: proc() {
 	data_init()
 	tokens, offsets := _tokenize(input_str)
 
-	_clean_up(tokens, input_str)
 	func_map := _identify_functions(tokens, string(input))
 	defer delete(func_map)
 
-	edits: []Edit
+	edits: [dynamic]Edit
+	_name_functions(&edits, tokens, string(input), func_map, offsets)
 
-	_write_output(output_file, tokens, input_str, edits)
+	_clean_up(tokens, input_str)
+	_write_output(output_file, tokens, input_str, edits[:])
 
 	os.close(output_file)
 }
@@ -551,14 +553,14 @@ _identify_functions :: proc(tokens: []Token, input: string) -> map[i32]Function_
 					assert(mov_location != 0)
 					jump_addr = i32(dptr)
 					if _, found := func_map[i32(mov_location)]; !found {
-						func_map[i32(mov_location)] = {}
+						func_map[i32(mov_location)] = { jump_addr = jump_addr }
 					}
 				case BANK_JUMP_1:
 					assert(dptr != 0)
 					assert(mov_location != 0)
 					jump_addr = i32(dptr + 0x8000)
 					if _, found := func_map[i32(mov_location)]; !found {
-						func_map[i32(mov_location)] = {}
+						func_map[i32(mov_location)] = { jump_addr = jump_addr }
 					}
 				case BANK_JUMP_2:
 					assert(dptr != 0)
@@ -566,7 +568,7 @@ _identify_functions :: proc(tokens: []Token, input: string) -> map[i32]Function_
 					jump_addr = i32(dptr + 0x10000)
 					func_map[i32(mov_location)] = {}
 					if _, found := func_map[i32(mov_location)]; !found {
-						func_map[i32(mov_location)] = {}
+						func_map[i32(mov_location)] = { jump_addr = jump_addr }
 					}
 				case BANK_JUMP_3:
 					panic("jump to bank 3?")
@@ -589,9 +591,11 @@ _identify_functions :: proc(tokens: []Token, input: string) -> map[i32]Function_
 					break
 				}
 
-				func_map[actual_addr] = {
-					jump_addr  = jump_addr,
-					name_token = i32(name_token),
+				if _, found := func_map[actual_addr]; !found {
+					func_map[actual_addr] = {
+						jump_addr  = 0,
+						name_token = i32(name_token),
+					}
 				}
 
 			case "12":   // LCALL
@@ -648,22 +652,91 @@ _clean_up :: proc(tokens: []Token, input: string) {
 	}
 
 	remove_memory_locations :: proc(tokens: []Token, input: string) {
-		// TODO
+		block_begin: int
+		for i := 0; i < len(tokens); i += 1 {
+			#partial switch tokens[i].kind {
+			case .Eol:
+				i += 1
+				if i >= len(tokens) {
+					return
+				}
+				if tokens[i].kind == .Location_Label {
+					switch _tok_to_string(tokens[i], input) {
+					case "CODE", "B0", "B1", "B2":
+					case:
+						for ; i < len(tokens) && tokens[i].kind != .Eol ; i += 1 { }
+						for j := block_begin; j <= i; j += 1 {
+							tokens[j].kind = .Null
+						}
+					}
+					block_begin = -1
+				} else if block_begin == -1 {
+					block_begin = i
+				}
+			}
+		}
 	}
-
-	edits: [dynamic]Edit
 
 	remove_useless_comments(tokens)
 	remove_memory_locations(tokens, input)
 
 }
 
+_name_functions :: proc(edits: ^[dynamic]Edit,
+	                tokens: []Token,
+	                input: string,
+	                func_map: map[i32]Function_Value,
+	                offsets: []i32) {
+	renames: map[string]string
+
+	for addr, func_val in func_map {
+		tok_idx := offsets[addr]
+
+		// search for function header
+		i := tok_idx - 1
+		if i >= 0 {
+			assert(tokens[i].kind == .Eol)
+			for i -= 1; i >= 0 && tokens[i].kind != .Eol; i -= 1 { }
+			i += 1
+
+			if _tok_to_string(tokens[i], input) == ";;;" {
+				continue
+			}
+		}
+
+		new_name: string
+		if func_val.jump_addr != 0 {
+			if func_val.name_token != 0 {
+				bank, jump_addr := _get_bank_jump(addr)
+				new_name = fmt.aprintf("jump_to_bank%d_%04x", bank, jump_addr)
+				renames[_tok_to_string(tokens[func_val.name_token], input)] = new_name
+			}
+		} else {
+			assert(func_val.name_token != 0)
+			new_name = _tok_to_string(tokens[func_val.name_token], input)
+		}
+		header := fmt.aprintf("\n; %s\n;;;", new_name)
+		append(edits, Edit{text = header, insert_idx = addr})
+	}
+}
+
 _write_output :: proc(f: ^os.File, tokens: []Token, input: string, edits: []Edit) {
+	cmp :: proc(e1, e2: Edit) -> bool {
+		return e1.insert_idx < e2.insert_idx
+	}
+	slice.sort_by(edits, cmp)
+
 	stream := os.to_stream(f)
 	w: bufio.Writer
 	bufio.writer_init(&w, stream)
 
-	for t in tokens {
+	edit_idx: int
+
+	for t, i in tokens {
+		for int(edits[edit_idx].insert_idx) == i {
+			bufio.writer_write_string(&w, edits[edit_idx].text)
+			edit_idx += 1
+		}
 		data := _tok_to_string(t, input)
 		#partial switch t.kind {
 		case .Trailing_Space:
@@ -685,4 +758,18 @@ _write_output :: proc(f: ^os.File, tokens: []Token, input: string, edits: []Edit
 
 _tok_to_string :: proc(t: Token, s: string) -> string {
 	return s[t.start:t.start + i32(t.length)]
+}
+
+_get_bank_jump :: proc(absolute: i32) -> (bank: int, addr: int) {
+	if absolute < 0x10000 {
+		bank = 0
+		addr = int(absolute)
+	} else if absolute < 0x18000 {
+		bank = 1
+		addr = int(absolute) - 0x8000
+	} else {
+		bank = 2
+		addr = int(absolute) - 0x10000
+	}
+	return
 }
