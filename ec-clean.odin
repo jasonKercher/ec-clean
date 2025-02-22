@@ -49,27 +49,24 @@ main :: proc() {
 	}
 	defer delete(input)
 
+	input_str := string(input)
+
 	data_init()
-	tokens, offsets := _tokenize(string(input))
+	tokens, offsets := _tokenize(input_str)
 
-	_remove_useless_comments(tokens)
+	_clean_up(tokens, input_str)
+	func_map := _identify_functions(tokens, string(input))
+	defer delete(func_map)
 
-	_write_output(output_file, input, tokens)
+	edits: []Edit
+
+	_write_output(output_file, tokens, input_str, edits)
+
 	os.close(output_file)
 }
 
 _instruction_map: map[string]Instruction
 _register_map:    map[string]Register
-
-BANK_JUMP_0 :: 0x4e00
-BANK_JUMP_1 :: 0x4e14
-BANK_JUMP_2 :: 0x4e28
-BANK_JUMP_3 :: 0x4e3c  // unused...
-
-LJMP_TO_BANK_JUMP_0 :: "024e00"
-LJMP_TO_BANK_JUMP_1 :: "024e14"
-LJMP_TO_BANK_JUMP_2 :: "024e28"
-LJMP_TO_BANK_JUMP_3 :: "024e3c"  // unused...
 
 Token_Kind :: enum u8 {
 	Null,        // edited out
@@ -113,6 +110,12 @@ Token :: struct {
 }
 
 #assert(size_of(Token) == 8)
+
+Function :: struct {
+	func_addr: i32,
+	jump_addr: i32,
+	name:      string,
+}
 
 Edit :: struct {
 	text:       string,
@@ -488,33 +491,180 @@ _tokenize :: proc(input: string) -> ([]Token, []i32) {
 	return tokens[:], offsets
 }
 
-_remove_useless_comments :: proc(tokens: []Token) {
-	line_begin := 0
-	for i := 0; i < len(tokens); i += 1 {
-		if tokens[i].kind == .Eol {
-			line_begin = i + 1
-			continue
+BANK_JUMP_0 :: 0x4e00
+BANK_JUMP_1 :: 0x4e14
+BANK_JUMP_2 :: 0x4e28
+BANK_JUMP_3 :: 0x4e3c  // unused...
+
+Function_Value :: struct {
+	jump_addr:  i32,
+	name_token: i32,
+}
+
+_identify_functions :: proc(tokens: []Token, input: string) -> map[i32]Function_Value {
+	dptr: uint
+	current_offset: int
+
+	mov_location: int
+	possible_jump_function: int
+
+	func_map: map[i32]Function_Value
+
+	for t, idx in tokens {
+		#partial switch t.kind {
+		case .Location_Label:
+			switch _tok_to_string(t, input) {
+			case "CODE", "B0":
+				current_offset = 0
+			case "B1":
+				current_offset = 0x8000
+			case "B2":
+				current_offset = 0x10000
+			}
+		case .Location:
+			possible_jump_function = int(t.value) + current_offset
+		case .Location_Bytes:
+			if t.length != 6 {
+				dptr = 0
+				break
+			}
+			raw := _tok_to_string(t, input)
+			switch raw[:2] {
+			case "90":   // MOV
+				addr, ok := strconv.parse_uint(raw[2:6], 16)
+				assert(ok)
+				dptr = addr
+				mov_location = possible_jump_function
+			case "02":   // LJMP
+				addr, ok := strconv.parse_uint(raw[2:6], 16)
+				assert(ok)
+
+				actual_addr := i32(addr)
+				if addr >= 0x8000 {
+					actual_addr += i32(current_offset)
+				}
+
+				jump_addr: i32
+				switch addr {
+				case BANK_JUMP_0:
+					assert(dptr != 0)
+					assert(mov_location != 0)
+					jump_addr = i32(dptr)
+					if _, found := func_map[i32(mov_location)]; !found {
+						func_map[i32(mov_location)] = {}
+					}
+				case BANK_JUMP_1:
+					assert(dptr != 0)
+					assert(mov_location != 0)
+					jump_addr = i32(dptr + 0x8000)
+					if _, found := func_map[i32(mov_location)]; !found {
+						func_map[i32(mov_location)] = {}
+					}
+				case BANK_JUMP_2:
+					assert(dptr != 0)
+					assert(mov_location != 0)
+					jump_addr = i32(dptr + 0x10000)
+					func_map[i32(mov_location)] = {}
+					if _, found := func_map[i32(mov_location)]; !found {
+						func_map[i32(mov_location)] = {}
+					}
+				case BANK_JUMP_3:
+					panic("jump to bank 3?")
+				}
+				dptr = 0
+				mov_location = 0
+
+				name_token := 0
+				for i := idx; i < len(tokens); i += 1 {
+					if tokens[i].kind == .Eol {
+						break
+					}
+					if tokens[i].kind == .Name {
+						name_token = i
+						break
+					}
+				}
+				jump_name := _tok_to_string(tokens[name_token], input)
+				if len(jump_name) < 4 || jump_name[:4] == "LAB_" {
+					break
+				}
+
+				func_map[actual_addr] = {
+					jump_addr  = jump_addr,
+					name_token = i32(name_token),
+				}
+
+			case "12":   // LCALL
+				addr, ok := strconv.parse_uint(raw[2:6], 16)
+				assert(ok)
+
+				actual_addr := i32(addr)
+				if addr > 0x8000 {
+					actual_addr += i32(current_offset)
+				}
+
+				name_token := 0
+				for i := idx; i < len(tokens); i += 1 {
+					if tokens[i].kind == .Eol {
+						break
+					}
+					if tokens[i].kind == .Name {
+						name_token = i
+						break
+					}
+				}
+				func_map[actual_addr] = {
+					jump_addr  = 0,
+					name_token = i32(name_token),
+				}
+			case:
+				mov_location = 0
+				dptr = 0
+			}
 		}
-		if tokens[i].kind == .Comment_Useless {
-			if i >= line_begin && tokens[i-1].kind == .Whitespace {
-				tokens[i-1].kind = .Null
-				tokens[i].kind = .Null
-				if i - 1 == line_begin && tokens[i + 1].kind == .Eol {
-					tokens[i+1].kind = .Null
-					line_begin = i + 2
+	}
+	return func_map
+}
+
+_clean_up :: proc(tokens: []Token, input: string) {
+	remove_useless_comments :: proc(tokens: []Token) {
+		line_begin := 0
+		for i := 0; i < len(tokens); i += 1 {
+			if tokens[i].kind == .Eol {
+				line_begin = i + 1
+				continue
+			}
+			if tokens[i].kind == .Comment_Useless {
+				if i >= line_begin && tokens[i-1].kind == .Whitespace {
+					tokens[i-1].kind = .Null
+					tokens[i].kind = .Null
+					if i - 1 == line_begin && tokens[i + 1].kind == .Eol {
+						tokens[i+1].kind = .Null
+						line_begin = i + 2
+					}
 				}
 			}
 		}
 	}
+
+	remove_memory_locations :: proc(tokens: []Token, input: string) {
+		// TODO
+	}
+
+	edits: [dynamic]Edit
+
+	remove_useless_comments(tokens)
+	remove_memory_locations(tokens, input)
+
 }
 
-_write_output :: proc(f: ^os.File, input: []u8, tokens: []Token) {
+_write_output :: proc(f: ^os.File, tokens: []Token, input: string, edits: []Edit) {
 	stream := os.to_stream(f)
 	w: bufio.Writer
 	bufio.writer_init(&w, stream)
 
 	for t in tokens {
-		data := input[t.start:t.start+i32(t.length)]
+		data := _tok_to_string(t, input)
 		#partial switch t.kind {
 		case .Trailing_Space:
 		case .Null:
@@ -527,8 +677,12 @@ _write_output :: proc(f: ^os.File, input: []u8, tokens: []Token) {
 			}
 		}
 
-		bufio.writer_write(&w, data)
+		bufio.writer_write_string(&w, data)
 	}
 
 	bufio.writer_flush(&w)
+}
+
+_tok_to_string :: proc(t: Token, s: string) -> string {
+	return s[t.start:t.start + i32(t.length)]
 }
